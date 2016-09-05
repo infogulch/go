@@ -53,11 +53,11 @@ package csv
 
 import (
 	"bufio"
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"unicode"
+	"unicode/utf8"
 )
 
 // A ParseError is returned for parsing errors.
@@ -111,10 +111,14 @@ type Reader struct {
 	// This is done even if the field delimiter, Comma, is white space.
 	TrimLeadingSpace bool
 
+	// line and column position are used to report error location
 	line   int
 	column int
-	r      *bufio.Reader
-	field  bytes.Buffer
+
+	r         *bufio.Reader
+	rawrecord []byte
+	fieldslen []int
+	record    [][]byte
 }
 
 // NewReader returns a new Reader that reads from r.
@@ -134,12 +138,41 @@ func (r *Reader) error(err error) error {
 	}
 }
 
+// ReadStream reads one record from r. The record is a slice of byte slices with
+// each byte slice representing one field. The returned record becomes invalid
+// upon the next call to ReadStream.
+func (r *Reader) ReadStream() (record [][]byte, err error) {
+	for {
+		var haveRecord bool
+		haveRecord, err = r.parseRecord()
+		if haveRecord {
+			record = r.buildRecord()
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if r.FieldsPerRecord > 0 {
+		if len(record) != r.FieldsPerRecord {
+			r.column = 0 // report at start of record
+			return record, r.error(ErrFieldCount)
+		}
+	} else if r.FieldsPerRecord == 0 {
+		r.FieldsPerRecord = len(record)
+	}
+	return record, nil
+}
+
 // Read reads one record from r. The record is a slice of strings with each
 // string representing one field.
 func (r *Reader) Read() (record []string, err error) {
 	for {
-		record, err = r.parseRecord()
-		if record != nil {
+		var haveRecord bool
+		haveRecord, err = r.parseRecord()
+		if haveRecord {
+			record = r.buildRecordString()
 			break
 		}
 		if err != nil {
@@ -198,6 +231,16 @@ func (r *Reader) readRune() (rune, error) {
 	return r1, err
 }
 
+func (r *Reader) writeRune(u rune) {
+	if u < utf8.RuneSelf {
+		r.rawrecord = append(r.rawrecord, byte(u))
+		return
+	}
+	var runeBytes [4]byte
+	n := utf8.EncodeRune(runeBytes[0:], u)
+	r.rawrecord = append(r.rawrecord, runeBytes[0:n]...)
+}
+
 // skip reads runes up to and including the rune delim or until error.
 func (r *Reader) skip(delim rune) error {
 	for {
@@ -212,7 +255,10 @@ func (r *Reader) skip(delim rune) error {
 }
 
 // parseRecord reads and parses a single csv record from r.
-func (r *Reader) parseRecord() (fields []string, err error) {
+func (r *Reader) parseRecord() (haveRecord bool, err error) {
+	r.rawrecord = r.rawrecord[:0]
+	r.fieldslen = r.fieldslen[:0]
+
 	// Each record starts on a new line. We increment our line
 	// number (lines start at 1, not 0) and set column to -1
 	// so as we increment in readRune it points to the character we read.
@@ -225,11 +271,11 @@ func (r *Reader) parseRecord() (fields []string, err error) {
 
 	r1, _, err := r.r.ReadRune()
 	if err != nil {
-		return nil, err
+		return false, err
 	}
 
 	if r.Comment != 0 && r1 == r.Comment {
-		return nil, r.skip('\n')
+		return false, r.skip('\n')
 	}
 	r.r.UnreadRune()
 
@@ -237,27 +283,41 @@ func (r *Reader) parseRecord() (fields []string, err error) {
 	for {
 		haveField, delim, err := r.parseField()
 		if haveField {
-			// If FieldsPerRecord is greater than 0 we can assume the final
-			// length of fields to be equal to FieldsPerRecord.
-			if r.FieldsPerRecord > 0 && fields == nil {
-				fields = make([]string, 0, r.FieldsPerRecord)
-			}
-			fields = append(fields, r.field.String())
+			r.fieldslen = append(r.fieldslen, len(r.rawrecord))
 		}
 		if delim == '\n' || err == io.EOF {
-			return fields, err
+			return len(r.fieldslen) > 0, err
 		} else if err != nil {
-			return nil, err
+			return false, err
 		}
 	}
+}
+
+func (r *Reader) buildRecord() [][]byte {
+	r.record = r.record[:0]
+	prev := 0
+	for _, offset := range r.fieldslen {
+		r.record = append(r.record, r.rawrecord[prev:offset])
+		prev = offset
+	}
+	return r.record
+}
+
+func (r *Reader) buildRecordString() []string {
+	record := make([]string, 0, len(r.fieldslen))
+	strRecord := string(r.rawrecord)
+	prev := 0
+	for _, offset := range r.fieldslen {
+		record = append(record, strRecord[prev:offset])
+		prev = offset
+	}
+	return record
 }
 
 // parseField parses the next field in the record. The read field is
 // located in r.field. Delim is the first character not part of the field
 // (r.Comma or '\n').
 func (r *Reader) parseField() (haveField bool, delim rune, err error) {
-	r.field.Reset()
-
 	r1, err := r.readRune()
 	for err == nil && r.TrimLeadingSpace && r1 != '\n' && unicode.IsSpace(r1) {
 		r1, err = r.readRune()
@@ -310,19 +370,19 @@ func (r *Reader) parseField() (haveField bool, delim rune, err error) {
 						return false, 0, r.error(ErrQuote)
 					}
 					// accept the bare quote
-					r.field.WriteRune('"')
+					r.writeRune('"')
 				}
 			case '\n':
 				r.line++
 				r.column = -1
 			}
-			r.field.WriteRune(r1)
+			r.writeRune(r1)
 		}
 
 	default:
 		// unquoted field
 		for {
-			r.field.WriteRune(r1)
+			r.writeRune(r1)
 			r1, err = r.readRune()
 			if err != nil || r1 == r.Comma {
 				break
