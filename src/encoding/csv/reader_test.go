@@ -313,3 +313,37 @@ x,,,
 		}
 	}
 }
+
+func BenchmarkReadNLarge(b *testing.B) {
+	benchReadN(b, "a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z\n")
+}
+
+func BenchmarkReadNSmall(b *testing.B) {
+	benchReadN(b, "a,b,c\n")
+}
+
+func benchReadN(b *testing.B, data string) {
+	r := NewReader(&repeatReader{content: data})
+	for i := 0; i < b.N; i++ {
+		_, err := r.Read()
+
+		if err != nil {
+			b.Fatalf("could not read data: %s", err)
+		}
+	}
+}
+
+type repeatReader struct {
+	content  string
+	expanded string
+	r        strings.Reader
+}
+
+func (r *repeatReader) Read(b []byte) (n int, err error) {
+	if len(r.expanded) < len(b) {
+		r.expanded = strings.Repeat(r.content, len(b)/len(r.content)+1)
+	}
+	skip := len(r.content) - (r.r.Len() % len(r.content))
+	r.r.Reset(r.expanded[skip:])
+	return r.r.Read(b)
+}
