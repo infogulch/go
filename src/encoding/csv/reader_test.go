@@ -325,7 +325,7 @@ func BenchmarkReadNSmall(b *testing.B) {
 func benchReadN(b *testing.B, data string) {
 	r := NewReader(&repeatReader{content: data})
 	for i := 0; i < b.N; i++ {
-		_, err := r.Read()
+		_, err := r.ReadStream()
 
 		if err != nil {
 			b.Fatalf("could not read data: %s", err)
